@@ -656,7 +656,13 @@ bool giflib_decoder_decode_frame(giflib_decoder d, opencv_mat mat)
         // only realloc if we need to size up
         // no point in shrinking, we'll free when decode has finished
         d->pixel_len = image_size;
-        d->pixels = (GifByteType*)(realloc(d->pixels, d->pixel_len * sizeof(GifPixelType)));
+        // Use a temporary to avoid losing the original pointer if realloc fails
+        void* tmp = realloc(d->pixels, d->pixel_len * sizeof(GifPixelType));
+        if (!tmp) {
+            fprintf(stderr, "encountered error, gif pixel buffer failed to allocate\n");
+            return false;
+        }
+        d->pixels = (GifByteType*)tmp;
     }
 
     if (d->pixels == NULL) {
@@ -944,8 +950,14 @@ static bool giflib_encoder_render_frame(giflib_encoder e,
 
     if (image_size > e->pixel_len) {
         // only realloc if we need to size up
+        // Use a temporary to avoid losing the original pointer if realloc fails
+        void* tmp = realloc(e->pixels, image_size * sizeof(GifPixelType));
+        if (!tmp) {
+            fprintf(stderr, "encountered error, gif encoder pixel buffer failed to allocate\n");
+            return false;
+        }
         e->pixel_len = image_size;
-        e->pixels = (GifByteType*)(realloc(e->pixels, e->pixel_len * sizeof(GifPixelType)));
+        e->pixels = (GifByteType*)tmp;
     }
 
     ColorMapObject* global_color_map = e->gif->SColorMap;
