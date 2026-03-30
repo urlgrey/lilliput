@@ -325,6 +325,20 @@ bool webp_decoder_decode(const webp_decoder d, opencv_mat mat)
     // Recalculate row size based on the new dimensions
     int row_size = cvMat->cols * cvMat->elemSize();
 
+    // Ensure decode_buffer is large enough for this frame's pixel data.
+    // The buffer was originally allocated for canvas dimensions; individual frames
+    // may be larger (animated WebP), which would cause a heap buffer overflow.
+    size_t required_size = (size_t)features.width * features.height * 4;
+    if (required_size > d->decode_buffer_size) {
+        delete[] d->decode_buffer;
+        d->decode_buffer = new uint8_t[required_size];
+        if (!d->decode_buffer) {
+            WebPDataClear(&frame.bitstream);
+            return false;
+        }
+        d->decode_buffer_size = required_size;
+    }
+
     // Store frame properties for future use
     d->prev_frame_delay_time = frame.duration;
     d->prev_frame_x_offset = frame.x_offset;
