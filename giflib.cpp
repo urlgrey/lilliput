@@ -940,12 +940,25 @@ static bool giflib_encoder_render_frame(giflib_encoder e,
     im_out->Width = frame->cols;
     im_out->Height = frame->rows;
 
-    int image_size = im_out->Width * im_out->Height;
+    // Use size_t to avoid signed integer overflow for large frame dimensions
+    size_t image_size = (size_t)im_out->Width * (size_t)im_out->Height;
+
+    // Check for multiplication overflow (Width * Height wraps around)
+    if (im_out->Height > 0 && image_size / (size_t)im_out->Height != (size_t)im_out->Width) {
+        fprintf(stderr, "encountered error, gif encoder frame dimensions overflow\n");
+        return false;
+    }
 
     if (image_size > e->pixel_len) {
         // only realloc if we need to size up
+        // Use a temporary to avoid losing the original pointer if realloc fails
+        void* tmp = realloc(e->pixels, image_size * sizeof(GifPixelType));
+        if (!tmp) {
+            fprintf(stderr, "encountered error, gif encoder pixel buffer failed to allocate\n");
+            return false;
+        }
         e->pixel_len = image_size;
-        e->pixels = (GifByteType*)(realloc(e->pixels, e->pixel_len * sizeof(GifPixelType)));
+        e->pixels = (GifByteType*)tmp;
     }
 
     ColorMapObject* global_color_map = e->gif->SColorMap;
