@@ -217,7 +217,12 @@ static avifResult avif_convert_yuv_to_rgb_with_tone_mapping(avifImage* image,
     avifRGBImage temp;
     avifRGBImageSetDefaults(&temp, image);
     temp.depth = image->depth;
-    temp.format = rgb->format;
+    // Force RGB (3-channel, no alpha) for the intermediate HDR buffer.
+    // avif_tonemap_rgb() assumes a 3-channel stride (idx = (y*w+x)*3).
+    // If we inherit rgb->format (which may be BGRA/4-channel when has_alpha is
+    // true) the stride calculation in the tone-mapping loop is wrong, causing
+    // an out-of-bounds read on every pixel past the first row.
+    temp.format = AVIF_RGB_FORMAT_RGB;
 
     avifResult result = avifRGBImageAllocatePixels(&temp);
     if (result != AVIF_RESULT_OK) {
