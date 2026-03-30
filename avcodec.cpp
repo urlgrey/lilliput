@@ -1,4 +1,5 @@
 #include "avcodec.hpp"
+#include <climits>
 
 #ifdef __cplusplus
 extern "C" {
@@ -303,8 +304,14 @@ int avcodec_decoder_get_width(const avcodec_decoder d)
         AVStream* st = d->container->streams[d->video_stream_index];
         if (st->sample_aspect_ratio.num > 0 && st->sample_aspect_ratio.den > 0 &&
             st->sample_aspect_ratio.num > st->sample_aspect_ratio.den) {
-            return (int64_t)d->codec->width * st->sample_aspect_ratio.num /
+            // Compute with int64_t to avoid signed integer overflow, then
+            // clamp to [1, INT_MAX] before truncating back to int.
+            int64_t adjusted = (int64_t)d->codec->width * st->sample_aspect_ratio.num /
               st->sample_aspect_ratio.den;
+            if (adjusted <= 0 || adjusted > INT_MAX) {
+                return d->codec->width;
+            }
+            return (int)adjusted;
         }
         return d->codec->width;
     }
@@ -317,8 +324,14 @@ int avcodec_decoder_get_height(const avcodec_decoder d)
         AVStream* st = d->container->streams[d->video_stream_index];
         if (st->sample_aspect_ratio.num > 0 && st->sample_aspect_ratio.den > 0 &&
             st->sample_aspect_ratio.den > st->sample_aspect_ratio.num) {
-            return (int64_t)d->codec->height * st->sample_aspect_ratio.den /
+            // Compute with int64_t to avoid signed integer overflow, then
+            // clamp to [1, INT_MAX] before truncating back to int.
+            int64_t adjusted = (int64_t)d->codec->height * st->sample_aspect_ratio.den /
               st->sample_aspect_ratio.num;
+            if (adjusted <= 0 || adjusted > INT_MAX) {
+                return d->codec->height;
+            }
+            return (int)adjusted;
         }
         return d->codec->height;
     }
