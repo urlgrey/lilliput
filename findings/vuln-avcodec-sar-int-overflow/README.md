@@ -70,7 +70,22 @@ Or:
 
 ## Proof of Concept
 
-See `repro/craft_mp4_sar_overflow.py` for analysis and a sample crafted MP4 atom structure.
+The script `repro/craft_mp4_sar_overflow.py` creates a real MP4 file:
+
+```bash
+# Requires: ffmpeg, python3
+python3 repro/craft_mp4_sar_overflow.py poc.mp4
+
+# Verify the SAR was injected:
+ffprobe -show_streams poc.mp4 2>/dev/null | grep sample_aspect
+# → sample_aspect_ratio=33554433:1
+
+# The MP4 is a valid 64x64 H.264 stream with a pasp atom
+# encoding SAR 33554433:1. When lilliput processes it:
+#   avcodec_decoder_get_width() computes (int64_t)64 * 33554433 / 1
+#   = 2,147,483,712 → truncated to int32 → -2,147,483,584
+#   Downstream buffer allocation uses negative width → heap overflow
+```
 
 ## Mitigation
 

