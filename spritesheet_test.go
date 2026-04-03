@@ -153,12 +153,15 @@ func TestGenerateSpriteSheet_NonVideoDecoder(t *testing.T) {
 	}
 }
 
-// TestGenerateSpriteSheet_Video is an integration test that requires a real video file.
-// It is skipped unless testdata/spritesheet_test.mp4 is present.
+// TestGenerateSpriteSheet_Video is an integration test against real video files.
 func TestGenerateSpriteSheet_Video(t *testing.T) {
+	// Try the dedicated test video first, then fall back to existing testdata.
 	videoPath := "testdata/spritesheet_test.mp4"
 	if _, err := os.Stat(videoPath); os.IsNotExist(err) {
-		t.Skip("testdata/spritesheet_test.mp4 not present; skipping integration test")
+		videoPath = "testdata/big_buck_bunny_480p_10s_std.mp4"
+	}
+	if _, err := os.Stat(videoPath); os.IsNotExist(err) {
+		t.Skip("no test video present; skipping integration test")
 	}
 
 	buf, err := os.ReadFile(videoPath)

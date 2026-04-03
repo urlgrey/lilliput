@@ -242,9 +242,21 @@ func GenerateSpriteSheet(d Decoder, opt *SpriteSheetOptions, dst []byte) ([]byte
 	// Zero-fill the canvas (black background).
 	C.opencv_mat_reset(sheet.mat)
 
-	// Allocate a reusable per-tile framebuffer.
-	tile := NewFramebuffer(srcW, srcH)
+	// Allocate a reusable per-tile framebuffer, pre-initialized to video dimensions.
+	// avcodec_decoder_copy_frame aligns the row stride to the next multiple of 32 pixels
+	// when width%32 != 0, so the backing buffer must be large enough for the aligned stride.
+	// Without this, opencv_mat_set_row_stride returns false and the decode silently fails
+	// (returning black tiles).
+	alignedSrcW := srcW
+	if srcW%32 != 0 {
+		alignedSrcW = srcW + 32 - (srcW % 32)
+	}
+	tileBufSize := alignedSrcW * srcH * 4
+	tile := &Framebuffer{buf: make([]byte, tileBufSize)}
 	defer tile.Close()
+	if err := tile.resizeMat(srcW, srcH, PixelType(C.CV_8UC4)); err != nil {
+		return nil, nil, fmt.Errorf("spritesheet: failed to initialize tile framebuffer: %w", err)
+	}
 
 	scaledTile := NewFramebuffer(tileW, tileH)
 	defer scaledTile.Close()
@@ -276,7 +288,7 @@ func GenerateSpriteSheet(d Decoder, opt *SpriteSheetOptions, dst []byte) ([]byte
 			continue
 		}
 
-		// The mat may have been resized by the decode; update the Framebuffer width/height.
+		// Sync width/height from the mat in case seek+decode changed them.
 		tile.width = int(C.opencv_mat_get_width(tile.mat))
 		tile.height = int(C.opencv_mat_get_height(tile.mat))
 
@@ -311,7 +323,9 @@ func GenerateSpriteSheet(d Decoder, opt *SpriteSheetOptions, dst []byte) ([]byte
 	}
 
 	// Encode the assembled sprite sheet.
-	enc, err := NewEncoder(fileType, nil, dst, nil)
+	// We pass the original decoder so NewEncoder can pull ICC/metadata;
+	// the canvas itself is sRGB so no HDR override is needed.
+	enc, err := NewEncoder(fileType, d, dst, nil)
 	if err != nil {
 		return nil, nil, fmt.Errorf("spritesheet: failed to create encoder: %w", err)
 	}
