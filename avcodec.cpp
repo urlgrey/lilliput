@@ -619,3 +619,71 @@ void avcodec_decoder_release(avcodec_decoder d)
 
     delete d;
 }
+
+bool avcodec_decoder_seek_and_decode(const avcodec_decoder d, float timestamp_sec, opencv_mat mat)
+{
+    if (!d || !d->container || !d->codec || !mat) {
+        return false;
+    }
+
+    // Convert seconds to AV_TIME_BASE units then to the stream's time base.
+    AVStream* stream = d->container->streams[d->video_stream_index];
+    int64_t ts = (int64_t)(timestamp_sec * AV_TIME_BASE);
+    // Seek to the nearest keyframe at or before the target timestamp.
+    int ret = av_seek_frame(d->container, -1, ts, AVSEEK_FLAG_BACKWARD);
+    if (ret < 0) {
+        return false;
+    }
+
+    // After a seek we must flush the codec's internal buffers.
+    avcodec_flush_buffers(d->codec);
+
+    // Convert target PTS to stream time base for comparison.
+    int64_t target_pts = (int64_t)(timestamp_sec / av_q2d(stream->time_base));
+
+    AVPacket packet;
+    bool success = false;
+    int max_packets = 512; // guard against infinite loops on broken files
+
+    while (!success && max_packets-- > 0) {
+        ret = av_read_frame(d->container, &packet);
+        if (ret < 0) {
+            break;
+        }
+
+        if (packet.stream_index != d->video_stream_index) {
+            av_packet_unref(&packet);
+            continue;
+        }
+
+        ret = avcodec_send_packet(d->codec, &packet);
+        av_packet_unref(&packet);
+        if (ret < 0 && ret != AVERROR(EAGAIN)) {
+            break;
+        }
+
+        AVFrame* frame = av_frame_alloc();
+        if (!frame) {
+            break;
+        }
+
+        ret = avcodec_receive_frame(d->codec, frame);
+        if (ret == 0) {
+            // Keep decoding forward until we reach or pass the target PTS.
+            int64_t frame_pts = (frame->pts != AV_NOPTS_VALUE) ? frame->pts : frame->best_effort_timestamp;
+            if (frame_pts >= target_pts) {
+                // This is the frame we want — convert and copy it.
+                ret = avcodec_decoder_copy_frame(d, mat, frame);
+                success = (ret >= 0);
+                av_frame_free(&frame);
+                break;
+            }
+        } else if (ret != AVERROR(EAGAIN)) {
+            av_frame_free(&frame);
+            break;
+        }
+        av_frame_free(&frame);
+    }
+
+    return success;
+}
