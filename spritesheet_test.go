@@ -10,10 +10,10 @@ import (
 // TestSelectTimestamps verifies the tile count and distribution rules from the RFC.
 func TestSelectTimestamps(t *testing.T) {
 	tests := []struct {
-		name          string
-		duration      time.Duration
-		wantMinTiles  int
-		wantMaxTiles  int
+		name         string
+		duration     time.Duration
+		wantMinTiles int
+		wantMaxTiles int
 	}{
 		{"zero duration", 0, 0, 0},
 		{"1 second", 1 * time.Second, 1, 1},
@@ -27,7 +27,7 @@ func TestSelectTimestamps(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := selectTimestamps(tt.duration)
+			got := selectTimestamps(tt.duration, nil, 0)
 			if len(got) < tt.wantMinTiles || len(got) > tt.wantMaxTiles {
 				t.Errorf("selectTimestamps(%v) = %d tiles, want [%d, %d]",
 					tt.duration, len(got), tt.wantMinTiles, tt.wantMaxTiles)
